@@ -1,0 +1,542 @@
+---
+title: "Predicting Melbourne Housing Prices"
+author: "Divya Shah"
+format:
+  html:
+    toc: true
+    toc-location: left
+    code-fold: true
+    code-tools: true
+execute:
+  warning: false
+  message: false
+---
+
+## Introduction
+
+The Melbourne Housing dataset contains information about residential property sales in Melbourne, Australia. The data includes property characteristics such as the number of rooms, property type, distance from the city center, number of bathrooms, available car spaces, land size, and geographic region.
+
+The goal of this project is to develop a predictive model for housing price. Two tree-based modeling approaches will be considered: a regression tree and a random forest. The models will be fit and evaluated using the `tidymodels` framework.
+
+The data will first be divided into a 70% training set and a 30% test set. Five-fold cross-validation will then be used within the training data to tune each model. The best regression tree and best random forest will be evaluated on the held-out test data, and the model with the better test performance will be selected as the final model.
+
+## Setup
+
+```{r}
+library(tidyverse)
+library(tidymodels)
+library(rpart)
+library(ranger)
+
+tidymodels_prefer()
+
+set.seed(558)
+```
+
+## Read the Data
+
+The Melbourne Housing data used in this project is the same dataset that was used for Project 2. The data is stored locally within the GitHub repository.
+
+```{r}
+housing <- read_csv(
+  "data/Melbourne_housing_FULL.csv",
+  show_col_types = FALSE
+)
+
+glimpse(housing)
+```
+
+The original dataset contains the following number of observations and variables.
+
+```{r}
+tibble(
+  observations = nrow(housing),
+  variables = ncol(housing)
+)
+```
+
+## Response Variable and Predictors
+
+The response variable for this analysis is `Price`, which represents the selling price of a property.
+
+The predictors used in the models are:
+
+- `Rooms`: number of rooms in the property
+- `Type`: type of property
+- `Distance`: distance from Melbourne's central business district
+- `Bathroom`: number of bathrooms
+- `Car`: number of car spaces
+- `Landsize`: land size of the property
+- `Regionname`: geographic region of the property
+
+These variables provide information about both the physical characteristics and location of each property.
+
+## Data Preparation
+
+Before modeling, the selected variables are retained and observations with missing values in any of these variables are removed.
+
+The categorical predictors `Type` and `Regionname` are also converted to factors.
+
+```{r}
+housing_model <- housing |>
+  select(
+    Price,
+    Rooms,
+    Type,
+    Distance,
+    Bathroom,
+    Car,
+    Landsize,
+    Regionname
+  ) |>
+  drop_na() |>
+  mutate(
+    Type = factor(Type),
+    Regionname = factor(Regionname)
+  )
+```
+
+The resulting modeling dataset contains:
+
+```{r}
+tibble(
+  observations = nrow(housing_model),
+  variables = ncol(housing_model)
+)
+```
+
+A summary of the cleaned modeling data is shown below.
+
+```{r}
+summary(housing_model)
+```
+
+## Model Evaluation Metric
+
+The primary metric used to compare the models will be **Root Mean Squared Error (RMSE)**.
+
+RMSE measures the typical size of the difference between the observed response values and the values predicted by the model. Because housing price is a numeric response, RMSE is an appropriate metric for evaluating prediction performance.
+
+RMSE also gives more weight to large prediction errors because the individual errors are squared before being averaged. This is useful for housing price prediction because very large prediction errors are especially undesirable.
+
+A smaller RMSE indicates better predictive performance.
+
+Mean Absolute Error (MAE) and R-squared will also be reported as additional measures of model performance, but RMSE will be used to choose the overall best model.
+
+```{r}
+model_metrics <- metric_set(rmse, mae, rsq)
+```
+
+## Training and Test Split
+
+The modeling data is divided into a training set containing 70% of the observations and a test set containing the remaining 30%.
+
+The training set will be used for model fitting and cross-validation. The test set will remain separate until the final models are chosen so that it can provide an estimate of performance on previously unseen data.
+
+A seed is set so that the split is reproducible.
+
+```{r}
+set.seed(558)
+
+housing_split <- initial_split(
+  housing_model,
+  prop = 0.70,
+  strata = Price
+)
+
+housing_train <- training(housing_split)
+housing_test <- testing(housing_split)
+```
+
+The sizes of the two datasets are:
+
+```{r}
+tibble(
+  dataset = c("Training", "Test"),
+  observations = c(
+    nrow(housing_train),
+    nrow(housing_test)
+  )
+)
+```
+
+## Five-Fold Cross-Validation
+
+Five-fold cross-validation is used on the training data for model tuning.
+
+The training data is divided into five folds. A model is repeatedly fit using four folds and evaluated using the remaining fold. Each fold serves as the validation fold once.
+
+The performance estimates from the five folds are then combined. This provides a more stable estimate of model performance than relying on a single validation split.
+
+```{r}
+set.seed(558)
+
+housing_folds <- vfold_cv(
+  housing_train,
+  v = 5,
+  strata = Price
+)
+
+housing_folds
+```
+
+## Preprocessing Recipe
+
+Both models will use the same preprocessing recipe.
+
+The categorical variables are converted into dummy variables so that they can be used consistently by the modeling engines.
+
+Tree-based models do not require predictors to be standardized because their splits are based on values and ordering rather than distances or coefficient magnitudes.
+
+```{r}
+housing_recipe <- recipe(
+  Price ~ .,
+  data = housing_train
+) |>
+  step_dummy(all_nominal_predictors())
+```
+
+# Regression Tree
+
+## Regression Tree Description
+
+A regression tree is a supervised learning model used when the response variable is numeric.
+
+The model repeatedly divides the predictor space into smaller regions using a sequence of decision rules. At each step, the algorithm chooses a predictor and a split point that produces the greatest improvement in prediction.
+
+For example, the model might first divide homes based on the number of rooms and then divide one of those groups based on distance or land size.
+
+Once the tree is complete, observations that follow the same sequence of decision rules end in the same terminal node. The predicted value for that region is based on the response values of the training observations contained in that node.
+
+Regression trees can capture nonlinear relationships and interactions between predictors without requiring those relationships to be specified in advance. They are also relatively easy to interpret.
+
+One disadvantage is that a single regression tree can have high variance. Small changes in the training data can sometimes result in a different set of splits.
+
+## Regression Tree Model Specification
+
+For the regression tree, two tuning parameters will be considered:
+
+- `cost_complexity`: controls the amount of pruning applied to the tree
+- `tree_depth`: controls the maximum depth of the tree
+
+```{r}
+tree_spec <- decision_tree(
+  cost_complexity = tune(),
+  tree_depth = tune(),
+  min_n = 10
+) |>
+  set_engine("rpart") |>
+  set_mode("regression")
+```
+
+The regression tree workflow combines the preprocessing recipe and model specification.
+
+```{r}
+tree_workflow <- workflow() |>
+  add_recipe(housing_recipe) |>
+  add_model(tree_spec)
+
+tree_workflow
+```
+
+## Regression Tree Tuning Grid
+
+A custom grid of tuning values is created.
+
+```{r}
+tree_grid <- crossing(
+  cost_complexity = c(
+    0.0001,
+    0.001,
+    0.005,
+    0.01,
+    0.05
+  ),
+  tree_depth = c(
+    3,
+    5,
+    8,
+    12
+  )
+)
+
+tree_grid
+```
+
+## Tune the Regression Tree
+
+Each combination of tuning parameters is evaluated using five-fold cross-validation on the training data.
+
+```{r}
+set.seed(558)
+
+tree_tune <- tune_grid(
+  tree_workflow,
+  resamples = housing_folds,
+  grid = tree_grid,
+  metrics = model_metrics
+)
+```
+
+The RMSE values for the candidate regression trees are:
+
+```{r}
+tree_tune |>
+  collect_metrics() |>
+  filter(.metric == "rmse") |>
+  arrange(mean)
+```
+
+The tuning parameters with the lowest cross-validation RMSE are selected.
+
+```{r}
+best_tree_params <- tree_tune |>
+  select_best(metric = "rmse")
+
+best_tree_params
+```
+
+## Final Regression Tree Workflow
+
+The best parameter values are inserted into the regression tree workflow.
+
+```{r}
+final_tree_workflow <- tree_workflow |>
+  finalize_workflow(best_tree_params)
+
+final_tree_workflow
+```
+
+# Random Forest
+
+## Random Forest Description
+
+A random forest is an ensemble model that combines predictions from many individual decision trees.
+
+A single decision tree can have high variance, meaning that relatively small changes in the training data may produce a substantially different tree. Random forests reduce this instability by fitting many trees and combining their predictions.
+
+Each tree is fit using a bootstrap sample of the training observations. A bootstrap sample is created by randomly sampling observations from the training data with replacement.
+
+Random forests introduce an additional source of randomness. At each possible tree split, only a random subset of the available predictors is considered. This helps prevent the individual trees from becoming too similar to one another.
+
+For a regression problem, the predictions produced by the individual trees are averaged to produce the final random forest prediction.
+
+The random forest therefore differs from a basic regression tree in two major ways:
+
+1. It combines many trees rather than relying on a single tree.
+2. Each split considers only a random subset of predictors.
+
+This often produces more stable and accurate predictions than a single regression tree, although random forests are more difficult to interpret.
+
+## Random Forest Model Specification
+
+The main tuning parameter considered for the random forest is `mtry`.
+
+`mtry` determines how many predictors are randomly considered as candidates at each split in each tree.
+
+The model will use 500 trees.
+
+```{r}
+rf_spec <- rand_forest(
+  mtry = tune(),
+  trees = 500,
+  min_n = 5
+) |>
+  set_engine(
+    "ranger",
+    importance = "impurity"
+  ) |>
+  set_mode("regression")
+```
+
+The random forest workflow is:
+
+```{r}
+rf_workflow <- workflow() |>
+  add_recipe(housing_recipe) |>
+  add_model(rf_spec)
+
+rf_workflow
+```
+
+## Random Forest Tuning Grid
+
+A custom grid of possible `mtry` values is created.
+
+```{r}
+rf_grid <- tibble(
+  mtry = c(
+    2,
+    4,
+    6,
+    8,
+    10
+  )
+)
+
+rf_grid
+```
+
+## Tune the Random Forest
+
+The random forest is tuned using the same five-fold cross-validation folds as the regression tree.
+
+```{r}
+set.seed(558)
+
+rf_tune <- tune_grid(
+  rf_workflow,
+  resamples = housing_folds,
+  grid = rf_grid,
+  metrics = model_metrics
+)
+```
+
+The cross-validation RMSE results are:
+
+```{r}
+rf_tune |>
+  collect_metrics() |>
+  filter(.metric == "rmse") |>
+  arrange(mean)
+```
+
+The `mtry` value with the lowest cross-validation RMSE is selected.
+
+```{r}
+best_rf_params <- rf_tune |>
+  select_best(metric = "rmse")
+
+best_rf_params
+```
+
+## Final Random Forest Workflow
+
+The selected `mtry` value is inserted into the random forest workflow.
+
+```{r}
+final_rf_workflow <- rf_workflow |>
+  finalize_workflow(best_rf_params)
+
+final_rf_workflow
+```
+
+# Test Set Evaluation
+
+Cross-validation was used to select the best version of each model family.
+
+The best regression tree and the best random forest are now fit using the entire training dataset and evaluated on the untouched test dataset.
+
+This provides a final comparison of how the two models perform on data that was not used during model training or tuning.
+
+## Regression Tree Test Performance
+
+```{r}
+tree_last_fit <- last_fit(
+  final_tree_workflow,
+  split = housing_split,
+  metrics = model_metrics
+)
+
+tree_test_metrics <- tree_last_fit |>
+  collect_metrics()
+
+tree_test_metrics
+```
+
+## Random Forest Test Performance
+
+```{r}
+rf_last_fit <- last_fit(
+  final_rf_workflow,
+  split = housing_split,
+  metrics = model_metrics
+)
+
+rf_test_metrics <- rf_last_fit |>
+  collect_metrics()
+
+rf_test_metrics
+```
+
+## Compare the Two Models
+
+The test-set performance of the two models is combined into one table.
+
+```{r}
+test_results <- bind_rows(
+  tree_test_metrics |>
+    mutate(model = "Regression Tree"),
+  
+  rf_test_metrics |>
+    mutate(model = "Random Forest")
+) |>
+  select(
+    model,
+    .metric,
+    .estimate
+  )
+
+test_results
+```
+
+Because RMSE is the primary evaluation metric, the model with the smaller test-set RMSE will be selected as the overall best model.
+
+```{r}
+rmse_comparison <- test_results |>
+  filter(.metric == "rmse") |>
+  arrange(.estimate)
+
+rmse_comparison
+```
+
+The winning model is:
+
+```{r}
+best_model_name <- rmse_comparison |>
+  slice(1) |>
+  pull(model)
+
+best_model_name
+```
+
+# Final Model Selection
+
+The regression tree and random forest were first tuned using five-fold cross-validation on the training data. The best model from each family was then fit using all of the training observations and evaluated using the held-out test set.
+
+The model with the smallest test RMSE is selected as the overall winner.
+
+```{r}
+if (best_model_name == "Regression Tree") {
+  final_workflow <- final_tree_workflow
+} else {
+  final_workflow <- final_rf_workflow
+}
+
+final_workflow
+```
+
+## Fit the Best Model to the Full Dataset
+
+After the final model is selected, it is fit one final time using the entire cleaned modeling dataset.
+
+At this point, the test set no longer needs to remain separate because model selection has already been completed.
+
+This final fitted model represents the model that will later be made available through the project's prediction API.
+
+```{r}
+final_model_fit <- final_workflow |>
+  fit(data = housing_model)
+
+final_model_fit
+```
+
+## Conclusion
+
+This analysis compared two tree-based approaches for predicting Melbourne housing prices: a regression tree and a random forest.
+
+Each model was tuned using five-fold cross-validation on the training data. The best model from each family was then evaluated using the held-out test set. RMSE was used as the primary model-selection metric because the response variable, housing price, is numeric and large prediction errors are particularly important in this application.
+
+The model with the lowest test-set RMSE was selected as the final predictive model and fit using the complete cleaned dataset.
+
+The selected model will next be incorporated into a `plumber` API so that users can provide property characteristics and obtain a predicted housing price.
