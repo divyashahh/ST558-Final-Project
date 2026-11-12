@@ -1,39 +1,77 @@
 library(plumber)
-library(tidyverse)
-library(tidymodels)
 library(ranger)
 
-tidymodels_prefer()
+set.seed(558)
 
-# Read and prepare data
-housing <- read_csv(
+# Read data
+housing <- read.csv(
   "data/Melbourne_housing_FULL.csv",
-  show_col_types = FALSE
+  stringsAsFactors = FALSE
 )
 
-housing_model <- housing |>
-  select(
-    Price,
-    Rooms,
-    Type,
-    Distance,
-    Bathroom,
-    Car,
-    Landsize,
-    Regionname
-  ) |>
-  drop_na() |>
-  mutate(
-    Type = factor(Type),
-    Regionname = factor(Regionname)
+# Keep only variables used in the final model
+housing_model <- housing[
+  ,
+  c(
+    "Price",
+    "Rooms",
+    "Type",
+    "Distance",
+    "Bathroom",
+    "Car",
+    "Landsize",
+    "Regionname"
   )
+]
 
-# Helper function for most common category
+# Convert numeric variables
+housing_model$Price <- as.numeric(housing_model$Price)
+housing_model$Rooms <- as.numeric(housing_model$Rooms)
+housing_model$Distance <- as.numeric(housing_model$Distance)
+housing_model$Bathroom <- as.numeric(housing_model$Bathroom)
+housing_model$Car <- as.numeric(housing_model$Car)
+housing_model$Landsize <- as.numeric(housing_model$Landsize)
+
+# Convert categorical variables
+housing_model$Type <- factor(housing_model$Type)
+housing_model$Regionname <- factor(housing_model$Regionname)
+
+# Remove incomplete rows
+housing_model <- housing_model[
+  complete.cases(housing_model),
+]
+
+# Save factor levels for prediction
+type_levels <- levels(housing_model$Type)
+region_levels <- levels(housing_model$Regionname)
+
+# Create dummy variables for training
+x_train <- model.matrix(
+  ~ Rooms + Type + Distance + Bathroom +
+    Car + Landsize + Regionname,
+  data = housing_model
+)
+
+# Remove intercept column
+x_train <- x_train[, -1, drop = FALSE]
+
+# Fit final random forest directly with ranger
+final_model <- ranger(
+  x = as.data.frame(x_train),
+  y = housing_model$Price,
+  mtry = 6,
+  num.trees = 500,
+  min.node.size = 5,
+  importance = "impurity",
+  seed = 558
+)
+
+# Function for finding the most common categorical value
 get_mode <- function(x) {
   names(sort(table(x), decreasing = TRUE))[1]
 }
 
-# Default predictor values
+# Default values required for the API
 default_rooms <- mean(housing_model$Rooms)
 default_type <- get_mode(housing_model$Type)
 default_distance <- mean(housing_model$Distance)
@@ -41,33 +79,6 @@ default_bathroom <- mean(housing_model$Bathroom)
 default_car <- mean(housing_model$Car)
 default_landsize <- mean(housing_model$Landsize)
 default_region <- get_mode(housing_model$Regionname)
-
-# Recipe used by final model
-housing_recipe <- recipe(
-  Price ~ .,
-  data = housing_model
-) |>
-  step_dummy(all_nominal_predictors())
-
-# Final random forest model
-rf_spec <- rand_forest(
-  mtry = 6,
-  trees = 500,
-  min_n = 5
-) |>
-  set_engine(
-    "ranger",
-    importance = "impurity"
-  ) |>
-  set_mode("regression")
-
-final_workflow <- workflow() |>
-  add_recipe(housing_recipe) |>
-  add_model(rf_spec)
-
-# Fit final model to full dataset
-final_model <- final_workflow |>
-  fit(data = housing_model)
 
 
 #* Predict Melbourne housing price
@@ -90,41 +101,105 @@ function(
     Regionname = default_region
 ) {
   
-  new_property <- tibble(
-    Rooms = as.numeric(Rooms),
+  # Convert incoming numeric values
+  Rooms <- as.numeric(Rooms)
+  Distance <- as.numeric(Distance)
+  Bathroom <- as.numeric(Bathroom)
+  Car <- as.numeric(Car)
+  Landsize <- as.numeric(Landsize)
+  
+  # Check for invalid numeric values
+  if (
+    is.na(Rooms) ||
+    is.na(Distance) ||
+    is.na(Bathroom) ||
+    is.na(Car) ||
+    is.na(Landsize)
+  ) {
+    return(
+      list(
+        error = "Rooms, Distance, Bathroom, Car, and Landsize must be numeric."
+      )
+    )
+  }
+  
+  # Check categorical inputs
+  if (!(Type %in% type_levels)) {
+    return(
+      list(
+        error = "Invalid Type. Use h, u, or t."
+      )
+    )
+  }
+  
+  if (!(Regionname %in% region_levels)) {
+    return(
+      list(
+        error = "Invalid Regionname."
+      )
+    )
+  }
+  
+  # Create new observation
+  new_property <- data.frame(
+    Rooms = Rooms,
     Type = factor(
       Type,
-      levels = levels(housing_model$Type)
+      levels = type_levels
     ),
-    Distance = as.numeric(Distance),
-    Bathroom = as.numeric(Bathroom),
-    Car = as.numeric(Car),
-    Landsize = as.numeric(Landsize),
+    Distance = Distance,
+    Bathroom = Bathroom,
+    Car = Car,
+    Landsize = Landsize,
     Regionname = factor(
       Regionname,
-      levels = levels(housing_model$Regionname)
+      levels = region_levels
     )
   )
   
-  if (is.na(new_property$Type)) {
-    return(list(
-      error = "Invalid property Type. Use h, u, or t."
-    ))
-  }
-  
-  if (is.na(new_property$Regionname)) {
-    return(list(
-      error = "Invalid Regionname."
-    ))
-  }
-  
-  prediction <- predict(
-    final_model,
-    new_data = new_property
+  # Create dummy variables using the same structure as training data
+  new_x <- model.matrix(
+    ~ Rooms + Type + Distance + Bathroom +
+      Car + Landsize + Regionname,
+    data = new_property
   )
   
+  # Remove intercept
+  new_x <- new_x[, -1, drop = FALSE]
+  
+  # Add any missing dummy-variable columns
+  missing_cols <- setdiff(
+    colnames(x_train),
+    colnames(new_x)
+  )
+  
+  if (length(missing_cols) > 0) {
+    for (col in missing_cols) {
+      new_x <- cbind(
+        new_x,
+        setNames(
+          data.frame(0),
+          col
+        )
+      )
+    }
+  }
+  
+  # Keep columns in exactly the same order as training data
+  new_x <- new_x[
+    ,
+    colnames(x_train),
+    drop = FALSE
+  ]
+  
+  # Generate prediction
+  prediction <- predict(
+    final_model,
+    data = as.data.frame(new_x)
+  )$predictions
+  
   list(
-    predicted_price = prediction$.pred
+    predicted_price = prediction
   )
 }
 
@@ -136,7 +211,8 @@ function() {
   
   list(
     name = "Divya Shah",
-    project_site = "https://divyashahh.github.io/ST558-Final-Project/modeling.html"
+    project_site =
+      "https://divyashahh.github.io/ST558-Final-Project/modeling.html"
   )
 }
 
